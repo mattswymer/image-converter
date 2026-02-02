@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Professional client-side image converter supporting WebP, AVIF, and JPEG. Off-main-thread processing for high performance.">
+<title>Image Converter Pro v3 (Worker Edition)</title>
+<style>
+    :root {
+        --primary: #2563eb; --primary-hover: #1d4ed8;
+        --success: #16a34a; --success-hover: #15803d;
+        --error: #dc2626; --warning: #f59e0b;
+        --bg: #f8fafc; --surface: #ffffff;
+        --text: #0f172a; --text-muted: #64748b;
+        --border: #e2e8f0;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+        font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text);
+        margin: 0; padding: 20px; line-height: 1.5;
+    }
+    .app {
+        max-width: 900px; margin: 0 auto; background: var(--surface);
+        border-radius: 12px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); overflow: hidden;
+    }
+    .header { padding: 1.5rem; text-align: center; border-bottom: 1px solid var(--border); background: #fff; }
+    .header h1 { margin: 0; font-size: 1.5rem; color: var(--text); }
+    .badge-pro { background: var(--primary); color: white; font-size: 0.7em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; }
+
+    /* Drop Zone */
+    .drop-zone {
+        margin: 1.5rem; padding: 3rem 2rem; border: 2px dashed var(--border); border-radius: 8px;
+        text-align: center; transition: all 0.2s; background: #f1f5f9; cursor: pointer;
+    }
+    .drop-zone.active { border-color: var(--primary); background: #eff6ff; }
+    .drop-zone * { pointer-events: none; } /* Prevent child event interference */
+    
+    /* Settings Grid */
+    .settings {
+        padding: 1.5rem; background: #fff; border-bottom: 1px solid var(--border);
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem;
+    }
+    .setting-group label { display: block; font-size: 0.875rem; font-weight: 600; margin-bottom: 0.5rem; color: var(--text-muted); }
+    .range-header { display: flex; justify-content: space-between; align-items: center; }
+    input[type=range] { width: 100%; cursor: pointer; }
+    input[type=number], select { width: 100%; padding: 0.6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); font-size: 1rem; }
+    .avif-warning { font-size: 0.75rem; color: var(--warning); margin-top: 4px; display: none; }
+    
+    /* File List */
+    .file-list { list-style: none; padding: 0; margin: 0; max-height: 55vh; overflow-y: auto; background: #f8fafc; }
+    .file-item {
+        display: grid; grid-template-columns: auto 60px 2fr 1fr auto; gap: 1rem;
+        padding: 0.75rem 1.5rem; border-bottom: 1px solid var(--border); align-items: center;
+        background: var(--surface); transition: background 0.2s;
+    }
+    .file-item:hover { background: #fcfcfc; }
+    .file-item.success { background: #f0fdf4; }
+    .file-item.error { background: #fef2f2; }
+    .thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 6px; background: #eee; border: 1px solid var(--border); }
+    .info .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .info .meta { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; display: flex; gap: 10px; align-items: center; }
+    .badge-saved { background: var(--success); color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.75rem; }
+    .status-col { font-size: 0.875rem; color: var(--text-muted); text-align: right; }
+
+    /* Controls */
+    .controls {
+        padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--surface);
+        display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;
+    }
+    .stats { font-size: 0.875rem; color: var(--text-muted); display: flex; gap: 1.5rem; }
+    .stats strong { color: var(--text); }
+    .btns { display: flex; gap: 0.75rem; }
+    .btn {
+        padding: 0.6rem 1.2rem; border-radius: 6px; font-weight: 600; border: none;
+        cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.95rem;
+    }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; filter: grayscale(1); }
+    .btn-pri { background: var(--primary); color: white; } .btn-pri:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-success { background: var(--success); color: white; } .btn-success:hover:not(:disabled) { background: var(--success-hover); }
+    .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); } .btn-ghost:hover:not(:disabled) { background: var(--bg); color: var(--text); }
+    .icon-btn { padding: 8px; background: transparent; border: none; cursor: pointer; font-size: 1.2rem; color: var(--border); border-radius: 4px; transition: all 0.2s; }
+    .icon-btn:hover { background: #f1f5f9; color: var(--text); }
+    .icon-btn.remove:hover { color: var(--error); background: #fef2f2; }
+
+    /* Utils */
+    .hidden { display: none !important; }
+    .progress-bar-container { height: 4px; background: var(--bg); width: 100%; }
+    .progress-bar { height: 100%; background: var(--success); width: 0%; transition: width 0.3s ease-out; }
+    input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; accent-color: var(--primary); }
+
+    @media (max-width: 640px) {
+        .settings { grid-template-columns: 1fr; }
+        .file-item { grid-template-columns: auto 50px 1fr auto; gap: 0.75rem; position: relative; }
+        .status-col { display: none; }
+        .controls { flex-direction: column; align-items: stretch; }
+        .stats { justify-content: space-between; }
+        .btns { flex-direction: column; }
+        .btn { width: 100%; justify-content: center; }
+    }
+</style>
+</head>
+<body>
+
+<div class="app">
+    <div class="header">
+        <h1>Image Converter <span class="badge-pro">PRO</span></h1>
+    </div>
+    <div class="progress-bar-container"><div id="progress" class="progress-bar"></div></div>
+
+    <div id="dropZone" class="drop-zone">
+        <div style="font-size: 3rem; margin-bottom: 1rem;">🧑‍💻</div>
+        <p style="margin: 0; font-weight: 600; font-size: 1.2rem; color: var(--text);">Drag & Drop Images</p>
+        <p style="margin: 0.5rem 0 0; color: var(--text-muted);">or click to browse (JPG, PNG, GIF, BMP, WEBP)</p>
+        <input type="file" id="fileInput" multiple accept="image/jpeg, image/png, image/gif, image/bmp, image/webp" class="hidden">
+    </div>
+
+    <div id="settingsPanel" class="settings hidden">
+        <div class="setting-group">
+            <label for="formatSelect">Output Format</label>
+            <select id="formatSelect">
+                <option value="image/webp">WebP (Recommended)</option>
+                <option value="image/jpeg">JPEG (Legacy)</option>
+                </select>
+            <div id="avifWarn" class="avif-warning">⚠️ AVIF encoding is very slow.</div>
+        </div>
+        <div class="setting-group">
+            <div class="range-header">
+                <label for="quality">Quality</label>
+                <span id="qVal" style="font-weight: bold; color: var(--primary);">80%</span>
+            </div>
+            <input type="range" id="quality" min="1" max="100" value="80">
+        </div>
+        <div class="setting-group">
+            <label for="maxWidth">Max Width (Optional px)</label>
+            <input type="number" id="maxWidth" placeholder="e.g. 1920" min="1">
+        </div>
+    </div>
+
+    <ul id="fileList" class="file-list hidden"></ul>
+
+    <div id="controlsPanel" class="controls hidden">
+        <div class="stats">
+            <span>Saved: <strong id="statSaved">0 B</strong></span>
+            <span>Ratio: <strong id="statRatio">0%</strong></span>
+        </div>
+        <div class="btns">
+            <button id="clearBtn" class="btn btn-ghost">Clear Finished</button>
+            <button id="mainDownloadBtn" class="btn btn-success hidden">Download</button>
+            <button id="convertBtn" class="btn btn-pri">Convert All</button>
+        </div>
+    </div>
+</div>
+
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+<script>
+// --- WORKER CODE (Embedded as a string for single-file portability) ---
+const workerScript = `
+self.onmessage = async (e) => {
+    const { id, bitmap, format, quality, maxWidth } = e.data;
+    try {
+        // Calculate dimensions
+        let w = bitmap.width, h = bitmap.height;
+        if (maxWidth && w > maxWidth) { h = Math.round(h * (maxWidth / w)); w = maxWidth; }
+
+        // Use OffscreenCanvas for heavy lifting off main thread
+        const canvas = new OffscreenCanvas(w, h);
+        const ctx = canvas.getContext('2d');
+        // High quality image scaling
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, w, h);
+
+        // Convert
+        const blob = await canvas.convertToBlob({ type: format, quality: quality });
+        
+        // Cleanup bitmap memory immediately in worker
+        bitmap.close(); 
+
+        if (!blob) throw new Error('Conversion result empty');
+        self.postMessage({ id, success: true, blob, size: blob.size });
+
+    } catch (err) {
+        if (bitmap) bitmap.close();
+        self.postMessage({ id, success: false, error: err.message });
+    }
+};
+`;
+
+(function() {
+    // --- App State & Config ---
+    const state = {
+        files: new Map(), // Map<id, FileData>
+        isProcessing: false,
+        stats: { original: 0, saved: 0 },
+        workerPool: [],
+        maxWorkers: navigator.hardwareConcurrency || 4,
+        activeWorkers: 0,
+        queue: []
+    };
+
+    const STORAGE_KEY = 'img_converter_settings_v1';
+    let defaultSettings = { format: 'image/webp', quality: 80, maxWidth: '' };
+
+    // --- DOM Elements ---
+    const $ = (id) => document.getElementById(id);
+    const dom = {
+        dropZone: $('dropZone'), fileInput: $('fileInput'), fileList: $('fileList'),
+        settings: $('settingsPanel'), controls: $('controlsPanel'),
+        formatSelect: $('formatSelect'), quality: $('quality'), qVal: $('qVal'), maxWidth: $('maxWidth'), avifWarn: $('avifWarn'),
+        progress: $('progress'),
+        convertBtn: $('convertBtn'), clearBtn: $('clearBtn'), mainDownloadBtn: $('mainDownloadBtn'),
+        statSaved: $('statSaved'), statRatio: $('statRatio')
+    };
+
+    // --- Initialization & Utilities ---
+    const init = async () => {
+        loadSettings();
+        await checkAvifSupport();
+        initWorkers();
+        setupEventListeners();
+    };
+
+    const loadSettings = () => {
+        try {
+            const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+            if (saved) defaultSettings = { ...defaultSettings, ...saved };
+        } catch (e) { console.log('Settings load error', e); }
+        
+        dom.formatSelect.value = defaultSettings.format;
+        dom.quality.value = defaultSettings.quality;
+        dom.qVal.textContent = defaultSettings.quality + '%';
+        dom.maxWidth.value = defaultSettings.maxWidth;
+        toggleAvifWarning();
+    };
+
+    const saveSettings = () => {
+        const settings = {
+            format: dom.formatSelect.value,
+            quality: parseInt(dom.quality.value),
+            maxWidth: dom.maxWidth.value
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    };
+
+    const checkAvifSupport = async () => {
+        // Feature detect AVIF encoding support
+        if (!HTMLCanvasElement.prototype.toBlob) return;
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1; canvas.height = 1;
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/avif'));
+            if (blob && blob.type === 'image/avif') {
+                const opt = document.createElement('option');
+                opt.value = 'image/avif'; opt.textContent = 'AVIF (Best Compression, Slow)';
+                dom.formatSelect.appendChild(opt);
+            }
+        } catch (e) { /* AVIF not supported silently fail */ }
+    };
+
+    const initWorkers = () => {
+        // Create Worker Blob from the string above
+        const blob = new Blob([workerScript], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        for (let i = 0; i < state.maxWorkers; i++) {
+            const worker = new Worker(workerUrl);
+            worker.onmessage = handleWorkerMessage;
+            state.workerPool.push(worker);
+        }
+        // URL.revokeObjectURL(workerUrl); // Keep active for lifetime of app
+    };
+
+    const uid = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    const formatSize = (b) => b === 0 ? '0 B' : b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : (b/1048576).toFixed(1) + ' MB';
+    const getExt = (mime) => mime.split('/')[1].replace('jpeg', 'jpg');
+
+    // --- Core Logic: File Handling & Processing Queue ---
+    const addFiles = (fileList) => {
+        if (state.isProcessing) return alert("Please wait for the current batch to finish.");
+        let added = false;
+        Array.from(fileList).forEach(file => {
+            // Basic mime check
+            if (!file.type.startsWith('image/')) return;
+            const id = uid();
+            state.files.set(id, {
+                id, file, status: 'idle', selected: false,
+                previewUrl: URL.createObjectURL(file) // Keep until removed
+            });
+            added = true;
+        });
+        if (added) renderUI();
+    };
+
+    const processQueue = async () => {
+        // 1. Prepare Queue
+        state.queue = Array.from(state.files.values()).filter(f => f.status === 'idle' || f.status === 'error');
+        if (state.queue.length === 0) return;
+
+        // 2. Lock UI & Save Settings
+        state.isProcessing = true;
+        dom.convertBtn.disabled = true; dom.convertBtn.textContent = 'Processing...';
+        dom.clearBtn.disabled = true;
+        dom.settings.classList.add('disabled'); // Visual cue
+        saveSettings();
+
+        // 3. Get current settings parameters
+        const params = {
+            format: dom.formatSelect.value,
+            quality: parseInt(dom.quality.value) / 100,
+            maxWidth: parseInt(dom.maxWidth.value) || 0
+        };
+
+        // 4. Start feeding the worker pool
+        state.totalToProcess = state.queue.length;
+        state.processedCount = 0;
+        updateProgress(0);
+        pumpWorkerQueue(params);
+    };
+
+    const pumpWorkerQueue = async (params) => {
+        while (state.queue.length > 0 && state.activeWorkers < state.maxWorkers) {
+            const item = state.queue.shift();
+            const worker = state.workerPool.pop();
+            state.activeWorkers++;
+
+            item.status = 'processing';
+            renderRow(item.id);
+
+            try {
+                // Create ImageBitmap on main thread for efficient transfer to worker
+                const bitmap = await createImageBitmap(item.file);
+                // Post data AND transfer the bitmap ownership (zero-copy transfer)
+                worker.postMessage({ id: item.id, bitmap, ...params }, [bitmap]);
+            } catch (e) {
+                // Handle bitmap creation failure (e.g., corrupted image)
+                handleWorkerMessage({ data: { id: item.id, success: false, error: 'Could not read image' } });
+                state.workerPool.push(worker); // Return unused worker
+                state.activeWorkers--;
+            }
+        }
+    };
+
+    const handleWorkerMessage = (e) => {
+        const { id, success, blob, size, error } = e.data;
+        const item = state.files.get(id);
+        const worker = e.target;
+
+        // 1. Update Item State
+        if (success) {
+            item.status = 'done';
+            item.result = { blob, size, url: URL.createObjectURL(blob), ext: getExt(blob.type) };
+            item.selected = true;
+            state.stats.original += item.file.size;
+            state.stats.saved += (item.file.size - size);
+        } else {
+            item.status = 'error';
+            item.errorMsg = error;
+        }
+
+        // 2. Update UI for this item
+        renderRow(id);
+        
+        // 3. Manage Pool & Progress
+        state.workerPool.push(worker);
+        state.activeWorkers--;
+        state.processedCount++;
+        updateProgress(state.processedCount / state.totalToProcess);
+
+        // 4. Continue or Finish
+        if (state.queue.length > 0) {
+             // Need current params again if queue is continuing.
+             const params = { format: dom.formatSelect.value, quality: parseInt(dom.quality.value)/100, maxWidth: parseInt(dom.maxWidth.value)||0 };
+             pumpWorkerQueue(params);
+        } else if (state.activeWorkers === 0) {
+            finalizeProcessing();
+        }
+    };
+
+    const finalizeProcessing = () => {
+        state.isProcessing = false;
+        updateProgress(1); // Ensure full bar at end
+        setTimeout(() => updateProgress(0), 1500); // Fade out
+        dom.convertBtn.textContent = 'Convert All';
+        dom.convertBtn.disabled = false;
+        dom.clearBtn.disabled = false;
+        dom.settings.classList.remove('disabled');
+        updateStats();
+        updateDownloadBtnState();
+    };
+
+    // --- UI Rendering & Interactions ---
+    const renderUI = () => {
+        const hasFiles = state.files.size > 0;
+        [dom.fileList, dom.settings, dom.controls].forEach(el => el.classList.toggle('hidden', !hasFiles));
+        
+        if (!hasFiles) {
+            dom.fileList.innerHTML = ''; updateStats();
+        } else {
+            // Efficiently update list: remove deleted, add new
+            Array.from(dom.fileList.children).forEach(li => {
+                if (!state.files.has(li.id.replace('row-', ''))) li.remove();
+            });
+            state.files.forEach((item, id) => {
+                 if (!$(`row-${id}`)) dom.fileList.appendChild(createRowEl(item));
+            });
+        }
+        updateDownloadBtnState();
+    };
+
+    const createRowEl = (item) => {
+        const li = document.createElement('li'); li.id = `row-${item.id}`; updateRowContent(li, item); return li;
+    };
+    
+    const renderRow = (id) => {
+        const li = $(`row-${id}`); if (li) updateRowContent(li, state.files.get(id));
+    };
+
+    const updateRowContent = (li, item) => {
+        li.className = `file-item ${item.status}`;
+        const isDone = item.status === 'done';
+        
+        // Checkbox
+        let checkHtml = '';
+        if (isDone) checkHtml = `<input type="checkbox" ${item.selected ? 'checked' : ''} onchange="toggleSelect('${item.id}')">`;
+        
+        // Info & Status
+        let metaHtml = `Orig: ${formatSize(item.file.size)}`; let statusTxt = item.status;
+        if (isDone) {
+            const saved = item.file.size - item.result.size;
+            metaHtml = `${item.result.ext.toUpperCase()}: ${formatSize(item.result.size)} ${saved > 0 ? `<span class="badge-saved">-${formatSize(saved)}</span>` : ''}`;
+            statusTxt = 'Finished';
+        } else if (item.status === 'error') { metaHtml = `<span style="color:var(--error)">${item.errorMsg || 'Failed'}</span>`; statusTxt = 'Error'; }
+        else if (item.status === 'processing') statusTxt = 'Converting...';
+
+        // Actions
+        let actionsHtml = '';
+        if (isDone) actionsHtml += `<button class="icon-btn" title="Download" onclick="downloadOne('${item.id}')">⬇️</button>`;
+        actionsHtml += `<button class="icon-btn remove" title="Remove" onclick="removeOne('${item.id}')">✕</button>`;
+
+        li.innerHTML = `
+            <div>${checkHtml}</div>
+            <img src="${item.previewUrl}" class="thumb" loading="lazy">
+            <div class="info"><div class="name" title="${item.file.name}">${item.file.name}</div><div class="meta">${metaHtml}</div></div>
+            <div class="status-col">${statusTxt}</div>
+            <div style="display:flex">${actionsHtml}</div>
+        `;
+    };
+
+    const updateStats = () => {
+        dom.statSaved.textContent = formatSize(state.stats.saved);
+        const ratio = state.stats.original > 0 ? ((state.stats.saved / state.stats.original) * 100).toFixed(1) : 0;
+        dom.statRatio.textContent = `${ratio}%`;
+    };
+
+    const updateProgress = (pct) => { dom.progress.style.width = `${pct * 100}%`; };
+
+    const updateDownloadBtnState = () => {
+        const selected = Array.from(state.files.values()).filter(f => f.status === 'done' && f.selected);
+        const count = selected.length; const btn = dom.mainDownloadBtn;
+        btn.onclick = null;
+        if (count === 0) { btn.classList.add('hidden'); }
+        else if (count === 1) {
+            btn.classList.remove('hidden'); btn.textContent = `Download File`;
+            btn.onclick = () => window.downloadOne(selected[0].id);
+        } else {
+            btn.classList.remove('hidden'); btn.textContent = `Download ZIP (${count})`;
+            btn.onclick = () => downloadZip(selected);
+        }
+    };
+
+    const toggleAvifWarning = () => dom.avifWarn.style.display = dom.formatSelect.value === 'image/avif' ? 'block' : 'none';
+
+    // --- Global Actions ---
+    window.toggleSelect = (id) => { const i = state.files.get(id); if(i) { i.selected = !i.selected; updateDownloadBtnState(); } };
+    window.removeOne = (id) => {
+        if (state.isProcessing) return;
+        const item = state.files.get(id);
+        if (item) {
+            URL.revokeObjectURL(item.previewUrl); if (item.result) URL.revokeObjectURL(item.result.url);
+            if (item.status === 'done') { state.stats.original -= item.file.size; state.stats.saved -= (item.file.size - item.result.size); }
+            state.files.delete(id); $(`row-${id}`).remove();
+            if (state.files.size === 0) renderUI(); else { updateStats(); updateDownloadBtnState(); }
+        }
+    };
+    window.downloadOne = (id) => {
+        const item = state.files.get(id); if (!item || !item.result) return;
+        const a = document.createElement('a'); a.href = item.result.url;
+        a.download = `${item.file.name.substring(0, item.file.name.lastIndexOf('.'))}_optimized.${item.result.ext}`;
+        a.click();
+    };
+    const downloadZip = async (items) => {
+        const btn = dom.mainDownloadBtn; btn.disabled = true; btn.textContent = 'Zipping...';
+        try {
+            if (!window.JSZip) throw new Error("JSZip not loaded");
+            const zip = new JSZip();
+            // Handle duplicate filenames in zip
+            const nameCount = {};
+            items.forEach(f => {
+                let base = f.file.name.substring(0, f.file.name.lastIndexOf('.'));
+                nameCount[base] = (nameCount[base] || 0) + 1;
+                if (nameCount[base] > 1) base += `_${nameCount[base]}`;
+                zip.file(`${base}.${f.result.ext}`, f.result.blob);
+            });
+            const content = await zip.generateAsync({type:"blob"});
+            const a = document.createElement('a'); a.href = URL.createObjectURL(content);
+            a.download = `converted_images_${new Date().toISOString().slice(0,19).replace(/[-T:]/g,'')}.zip`;
+            a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        } catch(e) { alert("Zip failed. " + e.message); }
+        btn.disabled = false; updateDownloadBtnState();
+    };
+
+    // --- Event Listeners ---
+    dom.quality.oninput = (e) => dom.qVal.textContent = `${e.target.value}%`;
+    dom.formatSelect.onchange = () => { toggleAvifWarning(); saveSettings(); };
+    dom.convertBtn.onclick = processQueue;
+    dom.clearBtn.onclick = () => {
+        if (state.isProcessing) return;
+        // Only clear finished/errored, keep pending
+        state.files.forEach((item, id) => {
+            if (item.status === 'done' || item.status === 'error') window.removeOne(id);
+        });
+        if (state.files.size === 0) { state.stats = { original: 0, saved: 0 }; renderUI(); }
+    };
+
+    ['dragenter', 'dragover'].forEach(evt => dom.dropZone.addEventListener(evt, (e) => { e.preventDefault(); dom.dropZone.classList.add('active'); }));
+    ['dragleave', 'drop'].forEach(evt => dom.dropZone.addEventListener(evt, (e) => { e.preventDefault(); dom.dropZone.classList.remove('active'); }));
+    dom.dropZone.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
+    dom.dropZone.onclick = (e) => { if(e.target !== dom.fileInput) dom.fileInput.click(); };
+    dom.fileInput.onchange = (e) => { addFiles(e.target.files); e.target.value = null; };
+    
+    // prevent accidental navigation during processing
+    window.onbeforeunload = () => state.isProcessing ? "Conversion in progress." : undefined;
+
+    init(); // Start App
+})();
+</script>
+</body>
+</html>
