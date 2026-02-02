@@ -305,4 +305,621 @@
         </div>
         <div class="setting-group">
             <label for="maxWidth">Max Width (Optional px)</label>
-            <input type="number"
+            <input type="number" id="maxWidth" placeholder="e.g. 1920" min="1">
+        </div>
+    </div>
+
+    <ul id="fileList" class="file-list hidden"></ul>
+
+    <div id="controlsPanel" class="controls hidden">
+        <div class="stats">
+            <span>Saved: <strong id="statSaved">0 B</strong></span>
+            <span>Ratio: <strong id="statRatio">0%</strong></span>
+        </div>
+        <div class="btns">
+            <button id="clearBtn" class="btn btn-ghost">Clear Finished</button>
+            <button id="mainDownloadBtn" class="btn btn-success hidden">Download</button>
+            <button id="convertBtn" class="btn btn-pri">Convert All</button>
+        </div>
+    </div>
+</div>
+
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+<script>
+/**
+ * ============================================================================
+ * WORKER SCRIPT
+ * Embedded as a string for portability (Single File Application)
+ * ============================================================================
+ */
+const workerScript = `
+self.onmessage = async (e) => {
+    const { id, bitmap, format, quality, maxWidth } = e.data;
+    try {
+        // 1. Calculate Dimensions
+        let w = bitmap.width, h = bitmap.height;
+        if (maxWidth && w > maxWidth) { 
+            h = Math.round(h * (maxWidth / w)); 
+            w = maxWidth; 
+        }
+
+        // 2. Initialize OffscreenCanvas
+        const canvas = new OffscreenCanvas(w, h);
+        const ctx = canvas.getContext('2d');
+        
+        // 3. High Quality Scaling
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, w, h);
+
+        // 4. Encode
+        const blob = await canvas.convertToBlob({ type: format, quality: quality });
+        
+        // 5. Cleanup Bitmap (Critical for memory management)
+        bitmap.close(); 
+
+        if (!blob) throw new Error('Conversion result empty');
+        self.postMessage({ id, success: true, blob, size: blob.size });
+
+    } catch (err) {
+        if (bitmap && bitmap.close) bitmap.close();
+        self.postMessage({ id, success: false, error: err.message });
+    }
+};
+`;
+
+(function() {
+    /**
+     * ========================================================================
+     * APP STATE & CONFIGURATION
+     * ========================================================================
+     */
+    const STORAGE_KEY = 'img_converter_settings_v1';
+
+    const state = {
+        files:          new Map(), // Map<id, FileData>
+        isProcessing:   false,
+        stats:          { original: 0, saved: 0 },
+        workerPool:     [],
+        maxWorkers:     navigator.hardwareConcurrency || 4,
+        activeWorkers:  0,
+        queue:          [],
+        totalToProcess: 0,
+        processedCount: 0
+    };
+
+    let defaultSettings = { 
+        format: 'image/webp', 
+        quality: 80, 
+        maxWidth: '' 
+    };
+
+    // DOM Cache
+    const $ = (id) => document.getElementById(id);
+    const dom = {
+        dropZone:        $('dropZone'), 
+        fileInput:       $('fileInput'), 
+        fileList:        $('fileList'),
+        settings:        $('settingsPanel'), 
+        controls:        $('controlsPanel'),
+        formatSelect:    $('formatSelect'), 
+        quality:         $('quality'), 
+        qVal:            $('qVal'), 
+        maxWidth:        $('maxWidth'), 
+        avifWarn:        $('avifWarn'),
+        progress:        $('progress'),
+        convertBtn:      $('convertBtn'), 
+        clearBtn:        $('clearBtn'), 
+        mainDownloadBtn: $('mainDownloadBtn'),
+        statSaved:       $('statSaved'), 
+        statRatio:       $('statRatio')
+    };
+
+    /**
+     * ========================================================================
+     * INITIALIZATION
+     * ========================================================================
+     */
+    const init = async () => {
+        loadSettings();
+        await checkAvifSupport();
+        initWorkers();
+        setupEventListeners();
+    };
+
+    const loadSettings = () => {
+        try {
+            const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+            if (saved) defaultSettings = { ...defaultSettings, ...saved };
+        } catch (e) { console.error('Settings load error', e); }
+        
+        dom.formatSelect.value = defaultSettings.format;
+        dom.quality.value      = defaultSettings.quality;
+        dom.qVal.textContent   = defaultSettings.quality + '%';
+        dom.maxWidth.value     = defaultSettings.maxWidth;
+        toggleAvifWarning();
+    };
+
+    const saveSettings = () => {
+        const settings = {
+            format:   dom.formatSelect.value,
+            quality:  parseInt(dom.quality.value),
+            maxWidth: dom.maxWidth.value
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    };
+
+    /**
+     * Feature detect AVIF encoding support.
+     * Silent failure if not supported.
+     */
+    const checkAvifSupport = async () => {
+        if (!HTMLCanvasElement.prototype.toBlob) return;
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1; canvas.height = 1;
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/avif'));
+            if (blob && blob.type === 'image/avif') {
+                const opt = document.createElement('option');
+                opt.value = 'image/avif'; 
+                opt.textContent = 'AVIF (Best Compression, Slow)';
+                dom.formatSelect.appendChild(opt);
+            }
+        } catch (e) { /* No AVIF support */ }
+    };
+
+    const initWorkers = () => {
+        const blob = new Blob([workerScript], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        for (let i = 0; i < state.maxWorkers; i++) {
+            const worker = new Worker(workerUrl);
+            worker.onmessage = handleWorkerMessage;
+            state.workerPool.push(worker);
+        }
+    };
+
+    // Utils
+    const uid = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    const getExt = (mime) => mime.split('/')[1].replace('jpeg', 'jpg');
+    
+    const formatSize = (b) => {
+        if (b === 0) return '0 B';
+        if (b < 1024) return b + ' B';
+        if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+        return (b/1048576).toFixed(1) + ' MB';
+    };
+
+    /**
+     * ========================================================================
+     * CORE LOGIC: FILE QUEUE & PROCESSING
+     * ========================================================================
+     */
+    const addFiles = (fileList) => {
+        if (state.isProcessing) return alert("Please wait for the current batch to finish.");
+        
+        let added = false;
+        Array.from(fileList).forEach(file => {
+            if (!file.type.startsWith('image/')) return;
+            const id = uid();
+            state.files.set(id, {
+                id, 
+                file, 
+                status: 'idle', 
+                selected: false,
+                previewUrl: URL.createObjectURL(file) 
+            });
+            added = true;
+        });
+        
+        if (added) renderUI();
+    };
+
+    const processQueue = async () => {
+        // 1. Identify Idle/Error files to retry
+        state.queue = Array.from(state.files.values()).filter(f => f.status === 'idle' || f.status === 'error');
+        if (state.queue.length === 0) return;
+
+        // 2. Lock UI & Save Settings
+        state.isProcessing = true;
+        dom.convertBtn.disabled = true; 
+        dom.convertBtn.textContent = 'Processing...';
+        dom.clearBtn.disabled = true;
+        dom.settings.classList.add('disabled'); 
+        saveSettings();
+
+        // 3. Prepare Queue
+        const params = {
+            format:   dom.formatSelect.value,
+            quality:  parseInt(dom.quality.value) / 100,
+            maxWidth: parseInt(dom.maxWidth.value) || 0
+        };
+
+        state.totalToProcess = state.queue.length;
+        state.processedCount = 0;
+        updateProgress(0);
+        
+        // 4. Start Feed
+        pumpWorkerQueue(params);
+    };
+
+    /**
+     * Feeds files to available workers.
+     * Contains detailed error handling for ImageBitmap creation failures.
+     */
+    const pumpWorkerQueue = async (params) => {
+        while (state.queue.length > 0 && state.activeWorkers < state.maxWorkers) {
+            const item = state.queue.shift();
+            const worker = state.workerPool.pop();
+            state.activeWorkers++;
+
+            item.status = 'processing';
+            renderRow(item.id);
+
+            try {
+                // Sanity check
+                if (item.file.size === 0) throw new Error("File is empty (0 bytes)");
+
+                // Attempt Bitmap Creation (The strict part)
+                const bitmap = await createImageBitmap(item.file);
+                
+                // Success - Zero-copy transfer to worker
+                worker.postMessage({ id: item.id, bitmap, ...params }, [bitmap]);
+
+            } catch (e) {
+                // --- DETAILED ERROR DIAGNOSTICS ---
+                let errorMsg = "Read failed";
+                
+                if (e.name === 'EncodingError') {
+                    errorMsg = "Corrupt/Unsupported Format"; 
+                } else if (e.name === 'InvalidStateError') {
+                    errorMsg = "Invalid Image Data";
+                } else if (e.name === 'RangeError' || e.message.toLowerCase().includes("memory")) {
+                    errorMsg = "Image too large (RAM)";
+                } else if (e.message) {
+                    // Truncate long browser messages
+                    errorMsg = e.message.length > 25 ? e.message.substring(0, 22) + '...' : e.message;
+                }
+
+                console.error(`Error processing ${item.file.name}:`, e);
+
+                // Fail gracefully
+                handleWorkerMessage({ 
+                    data: { id: item.id, success: false, error: errorMsg } 
+                });
+                
+                // Return worker immediately since it wasn't used
+                state.workerPool.push(worker); 
+                state.activeWorkers--;
+            }
+        }
+    };
+
+    const handleWorkerMessage = (e) => {
+        const { id, success, blob, size, error } = e.data;
+        const item = state.files.get(id);
+        const worker = e.target; // Identify which worker finished
+
+        // 1. Update State
+        if (success) {
+            item.status = 'done';
+            item.result = { blob, size, url: URL.createObjectURL(blob), ext: getExt(blob.type) };
+            item.selected = true;
+            state.stats.original += item.file.size;
+            state.stats.saved += (item.file.size - size);
+        } else {
+            item.status = 'error';
+            item.errorMsg = error;
+        }
+
+        // 2. Render & Cleanup
+        renderRow(id);
+        
+        // 3. Return Worker to Pool
+        // Only push back if it's an actual worker object (handleWorkerMessage can be called manually on read error)
+        if (worker instanceof Worker) {
+            state.workerPool.push(worker);
+            state.activeWorkers--;
+        }
+
+        state.processedCount++;
+        updateProgress(state.processedCount / state.totalToProcess);
+
+        // 4. Continue Loop or Finalize
+        if (state.queue.length > 0) {
+             const params = { 
+                 format: dom.formatSelect.value, 
+                 quality: parseInt(dom.quality.value)/100, 
+                 maxWidth: parseInt(dom.maxWidth.value)||0 
+             };
+             pumpWorkerQueue(params);
+        } else if (state.activeWorkers === 0) {
+            finalizeProcessing();
+        }
+    };
+
+    const finalizeProcessing = () => {
+        state.isProcessing = false;
+        updateProgress(1); 
+        setTimeout(() => updateProgress(0), 1500); // Fade out bar
+        
+        dom.convertBtn.textContent = 'Convert All';
+        dom.convertBtn.disabled = false;
+        dom.clearBtn.disabled = false;
+        dom.settings.classList.remove('disabled');
+        
+        updateStats();
+        updateDownloadBtnState();
+    };
+
+    /**
+     * ========================================================================
+     * UI RENDERING
+     * ========================================================================
+     */
+    const renderUI = () => {
+        const hasFiles = state.files.size > 0;
+        
+        // Toggle visibility of major panels
+        [dom.fileList, dom.settings, dom.controls].forEach(el => 
+            el.classList.toggle('hidden', !hasFiles)
+        );
+        
+        if (!hasFiles) {
+            dom.fileList.innerHTML = ''; 
+            updateStats();
+        } else {
+            // Sync DOM with Map state (Remove deleted, Add new)
+            Array.from(dom.fileList.children).forEach(li => {
+                if (!state.files.has(li.id.replace('row-', ''))) li.remove();
+            });
+            state.files.forEach((item, id) => {
+                 if (!$(`row-${id}`)) dom.fileList.appendChild(createRowEl(item));
+            });
+        }
+        updateDownloadBtnState();
+    };
+
+    const createRowEl = (item) => {
+        const li = document.createElement('li'); 
+        li.id = `row-${item.id}`; 
+        updateRowContent(li, item); 
+        return li;
+    };
+    
+    const renderRow = (id) => {
+        const li = $(`row-${id}`); 
+        if (li) updateRowContent(li, state.files.get(id));
+    };
+
+    const updateRowContent = (li, item) => {
+        li.className = `file-item ${item.status}`;
+        const isDone = item.status === 'done';
+        
+        // 1. Checkbox
+        let checkHtml = '';
+        if (isDone) {
+            checkHtml = `<input type="checkbox" ${item.selected ? 'checked' : ''} onchange="toggleSelect('${item.id}')">`;
+        }
+        
+        // 2. Info & Status
+        let metaHtml = `Orig: ${formatSize(item.file.size)}`; 
+        let statusTxt = item.status;
+
+        if (isDone) {
+            const saved = item.file.size - item.result.size;
+            metaHtml = `${item.result.ext.toUpperCase()}: ${formatSize(item.result.size)} ${saved > 0 ? `<span class="badge-saved">-${formatSize(saved)}</span>` : ''}`;
+            statusTxt = 'Finished';
+        } else if (item.status === 'error') {
+            // Enhanced Error Display with Tooltip
+            metaHtml = `<span style="color:var(--error); cursor:help; border-bottom:1px dotted var(--error);" title="${item.errorMsg}">⚠️ ${item.errorMsg || 'Failed'}</span>`; 
+            statusTxt = 'Error'; 
+        } else if (item.status === 'processing') {
+            statusTxt = 'Converting...';
+        }
+
+        // 3. Action Buttons
+        let actionsHtml = '';
+        if (isDone) {
+            actionsHtml += `<button class="icon-btn" title="Download" onclick="downloadOne('${item.id}')">⬇️</button>`;
+        }
+        actionsHtml += `<button class="icon-btn remove" title="Remove" onclick="removeOne('${item.id}')">✕</button>`;
+
+        // 4. Construct HTML
+        li.innerHTML = `
+            <div>${checkHtml}</div>
+            <img src="${item.previewUrl}" class="thumb" loading="lazy" alt="Preview">
+            <div class="info">
+                <div class="name" title="${item.file.name}">${item.file.name}</div>
+                <div class="meta">${metaHtml}</div>
+            </div>
+            <div class="status-col">${statusTxt}</div>
+            <div style="display:flex">${actionsHtml}</div>
+        `;
+    };
+
+    const updateStats = () => {
+        dom.statSaved.textContent = formatSize(state.stats.saved);
+        const ratio = state.stats.original > 0 
+            ? ((state.stats.saved / state.stats.original) * 100).toFixed(1) 
+            : 0;
+        dom.statRatio.textContent = `${ratio}%`;
+    };
+
+    const updateProgress = (pct) => { 
+        dom.progress.style.width = `${pct * 100}%`; 
+    };
+
+    const updateDownloadBtnState = () => {
+        const selected = Array.from(state.files.values())
+                              .filter(f => f.status === 'done' && f.selected);
+        const count = selected.length; 
+        const btn = dom.mainDownloadBtn;
+        
+        btn.onclick = null;
+        
+        if (count === 0) { 
+            btn.classList.add('hidden'); 
+        } else if (count === 1) {
+            btn.classList.remove('hidden'); 
+            btn.textContent = `Download File`;
+            btn.onclick = () => window.downloadOne(selected[0].id);
+        } else {
+            btn.classList.remove('hidden'); 
+            btn.textContent = `Download ZIP (${count})`;
+            btn.onclick = () => downloadZip(selected);
+        }
+    };
+
+    const toggleAvifWarning = () => {
+        dom.avifWarn.style.display = dom.formatSelect.value === 'image/avif' ? 'block' : 'none';
+    };
+
+    /**
+     * ========================================================================
+     * GLOBAL ACTIONS (Exposed to Window)
+     * ========================================================================
+     */
+    window.toggleSelect = (id) => { 
+        const i = state.files.get(id); 
+        if(i) { 
+            i.selected = !i.selected; 
+            updateDownloadBtnState(); 
+        } 
+    };
+
+    window.removeOne = (id) => {
+        if (state.isProcessing) return;
+        
+        const item = state.files.get(id);
+        if (item) {
+            // Revoke URLs to free memory
+            URL.revokeObjectURL(item.previewUrl); 
+            if (item.result) URL.revokeObjectURL(item.result.url);
+            
+            // Adjust stats if it was a finished file
+            if (item.status === 'done') { 
+                state.stats.original -= item.file.size; 
+                state.stats.saved -= (item.file.size - item.result.size); 
+            }
+            
+            // Delete and update UI
+            state.files.delete(id); 
+            $(`row-${id}`).remove();
+            
+            if (state.files.size === 0) renderUI(); 
+            else { 
+                updateStats(); 
+                updateDownloadBtnState(); 
+            }
+        }
+    };
+
+    window.downloadOne = (id) => {
+        const item = state.files.get(id); 
+        if (!item || !item.result) return;
+        
+        const a = document.createElement('a'); 
+        a.href = item.result.url;
+        const baseName = item.file.name.substring(0, item.file.name.lastIndexOf('.'));
+        a.download = `${baseName}_optimized.${item.result.ext}`;
+        a.click();
+    };
+
+    const downloadZip = async (items) => {
+        const btn = dom.mainDownloadBtn; 
+        btn.disabled = true; 
+        btn.textContent = 'Zipping...';
+        
+        try {
+            if (!window.JSZip) throw new Error("JSZip dependency not loaded");
+            
+            const zip = new JSZip();
+            const nameCount = {};
+
+            items.forEach(f => {
+                let base = f.file.name.substring(0, f.file.name.lastIndexOf('.'));
+                // Handle duplicate filenames
+                nameCount[base] = (nameCount[base] || 0) + 1;
+                if (nameCount[base] > 1) base += `_${nameCount[base]}`;
+                
+                zip.file(`${base}.${f.result.ext}`, f.result.blob);
+            });
+
+            const content = await zip.generateAsync({type:"blob"});
+            const a = document.createElement('a'); 
+            a.href = URL.createObjectURL(content);
+            const dateStr = new Date().toISOString().slice(0,19).replace(/[-T:]/g,'');
+            a.download = `converted_images_${dateStr}.zip`;
+            a.click(); 
+            
+            setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+            
+        } catch(e) { 
+            alert("Zip failed. " + e.message); 
+        }
+        
+        btn.disabled = false; 
+        updateDownloadBtnState();
+    };
+
+    /**
+     * ========================================================================
+     * EVENT LISTENERS
+     * ========================================================================
+     */
+    const setupEventListeners = () => {
+        // Inputs
+        dom.quality.oninput = (e) => dom.qVal.textContent = `${e.target.value}%`;
+        dom.formatSelect.onchange = () => { 
+            toggleAvifWarning(); 
+            saveSettings(); 
+        };
+
+        // Buttons
+        dom.convertBtn.onclick = processQueue;
+        dom.clearBtn.onclick = () => {
+            if (state.isProcessing) return;
+            // Only clear finished/errored, keep pending
+            state.files.forEach((item, id) => {
+                if (item.status === 'done' || item.status === 'error') window.removeOne(id);
+            });
+            if (state.files.size === 0) { 
+                state.stats = { original: 0, saved: 0 }; 
+                renderUI(); 
+            }
+        };
+
+        // Drag & Drop
+        ['dragenter', 'dragover'].forEach(evt => 
+            dom.dropZone.addEventListener(evt, (e) => { 
+                e.preventDefault(); 
+                dom.dropZone.classList.add('active'); 
+            })
+        );
+        ['dragleave', 'drop'].forEach(evt => 
+            dom.dropZone.addEventListener(evt, (e) => { 
+                e.preventDefault(); 
+                dom.dropZone.classList.remove('active'); 
+            })
+        );
+        
+        dom.dropZone.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
+        dom.dropZone.onclick = (e) => { 
+            if(e.target !== dom.fileInput) dom.fileInput.click(); 
+        };
+        dom.fileInput.onchange = (e) => { 
+            addFiles(e.target.files); 
+            e.target.value = null; 
+        };
+        
+        // Safety
+        window.onbeforeunload = () => state.isProcessing ? "Conversion in progress." : undefined;
+    };
+
+    init(); // Boot
+
+})();
+</script>
+</body>
+</html>
